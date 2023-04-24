@@ -1,4 +1,4 @@
-# Encryption and Authentication in DMSG
+# Authentication
 
 ## Local Visor
 
@@ -151,7 +151,7 @@ out = s.ss.EncryptAndHash(out, payload)
 ```
 
 #### MakeSignedStreamRequest
-After the Noise Handshake Messages is generated we create an object that is sent to the remote peer with [MakeSignedStreamRequest](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L104) which takes in the parameters `StreamResponse` and `cipher.SecKey` local static Private key.
+After the Noise Handshake Messages is generated we create an object that is sent to the remote peer with [MakeSignedStreamRequest](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L104) which takes in the parameters `StreamRequest` and `cipher.SecKey` local static Private key.
 ```
 req = StreamRequest{
 	Timestamp: time.Now().UnixNano(),
@@ -164,12 +164,16 @@ obj := MakeSignedStreamRequest(&req, s.ses.localSK())
 ```
 
 ### Write request
-The request object is then written to the stream with 
+The request object is then written to the stream with [ses.writeObject]()
 ```
 // Write request.
 err = s.ses.writeObject(s.yStr, obj)
 ```
-and awaits the response from the remote peer.
+and awaits the response from the remote visor.
+The object is encrypted before sending with `sc.ns.EncryptUnsafe` in `writeObject`
+```
+p := sc.ns.EncryptUnsafe(obj)
+```
 
 ## Remote Visor
 To accept the incoming stream we do the handshake with first [readRequest](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/stream.go#L90) which reads the Noise message from the initiator from the request and then generates a Noise message of it's own and sends it with [writeResponse](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/stream.go#L115)
@@ -187,6 +191,35 @@ in [acceptStream](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/client_s
 
 ### readRequest
 We read the incoming request from the local visor (initator) via stream.
+
+#### Obtain request
+Before we do anything we first obrain the request sent by the initiator by first reading the [SignedObject](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L101) from the `*yamux.Stream` with [ses.readObject](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/session_common.go#L131)
+```
+var obj SignedObject
+if obj, err = s.ses.readObject(s.yStr); err != nil {
+	return
+}
+```
+In `readObject` we use `sc.ns.DecryptWithNonceMap(sc.nMap, pb)` to decrypt the encrypted object received from the initiator.
+Then we obtain the request from the signed object with [obj.ObtainStreamRequest](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L144)
+```
+if req, err = obj.ObtainStreamRequest(); err != nil {
+	return
+}
+```
+This request is then verified with [req.Verify](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L176) where the Signature of the request is checked with [cipher.VerifyPubKeySignedPayload](https://github.com/skycoin/skywire-utilities/blob/develop/pkg/cipher/cipher.go#L244) among other things.
+```
+if err = req.Verify(0); err != nil {
+	return
+}
+```
+The PK in the request is also check checked against the PK of the session
+```
+if req.DstAddr.PK != s.ses.LocalPK() {
+	err = ErrReqInvalidDstPK
+	return
+}
+```
 
 #### Prepare fields
 We set up the protocals required for encryption and authentication inside `dStr.readRequest`  with 
@@ -286,7 +319,7 @@ if err != nil {
 ```
 
 ### writeResponse
-After the remote visor reads the request from the local visor (initiator) it writes back a handshake response to it.
+After the remote visor reads the request from the local visor (initiator) it writes back a handshake response to it. It also takes in the paramater `cipher.SHA256` which is the hash of the request that was received, generated with `req.raw.Hash()` and sent back to the initiator in the response
 
 #### MakeHandshakeMessage
 ```
@@ -304,7 +337,7 @@ func (ns *Noise) MakeHandshakeMessage() (res []byte, err error) {
 	if ns.hs.MessageIndex() < len(ns.pattern.Messages)-1 {
 		res, _, _, err = ns.hs.WriteMessage(nil, nil)
 		return
-	} 
+	}
 	res, ns.dec, ns.enc, err = ns.hs.WriteMessage(nil, nil)
 	return res, err
 }
@@ -357,6 +390,30 @@ The `ciperStates` are generated with [s.ss.Split](https://github.com/skycoin/noi
 cs1, cs2 := s.ss.Split()
 ```
 
+#### MakeSignedStreamResponse
+After the Noise Handshake Response Messages is generated we create an object that is sent back to the initiator peer with [MakeSignedStreamResponse](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L113) which takes in the parameters `StreamResponse` and `cipher.SecKey` local static Private key.
+```
+resp := StreamResponse{
+	ReqHash: reqHash,
+	Accepted: true,
+	NoiseMsg: nsMsg,
+}
+obj := MakeSignedStreamResponse(&resp, s.ses.localSK())
+```
+
+### Write request
+The request object is then written to the stream with [ses.writeObject]()
+```
+if err := s.ses.writeObject(s.yStr, obj); err != nil {
+	return err
+}
+```
+and awaits the response from the remote visor.
+The object is encrypted before sending with `sc.ns.EncryptUnsafe` in `writeObject`
+```
+p := sc.ns.EncryptUnsafe(obj)
+```
+
 ## Local Visor
 
 After writing the request the local visor awaits the response and reads it with [dStr.readResponse](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/stream.go#L146)
@@ -368,6 +425,30 @@ if err := dStr.readResponse(req); err != nil {
 
 ### readResponse
 We read the incoming response to our request from the remote visor via stream.
+
+#### Obtain Response
+Before we do anything we first obrain the request sent by the initiator by first reading the [SignedObject](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L101) from the `*yamux.Stream` with [ses.readObject](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/session_common.go#L131)
+```
+obj, err := s.ses.readObject(s.yStr)
+if err != nil {
+	return err
+}
+```
+In `readObject` we use `sc.ns.DecryptWithNonceMap(sc.nMap, pb)` to decrypt the encrypted object received from the remote visor.
+Then we obtain the response from the signed object with [obj.ObtainStreamResponse](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L155)
+```
+resp, err := obj.ObtainStreamResponse()
+if err != nil {
+	return err
+}
+```
+This response is then verified with [resp.Verify](https://github.com/skycoin/dmsg/blob/develop/pkg/dmsg/types.go#L213) where the `request hash` of the request sent is checked against the `ReqHash` field in the  `StreamResponse`.
+Signature of the response is checked with [cipher.VerifyPubKeySignedPayload](https://github.com/skycoin/skywire-utilities/blob/develop/pkg/cipher/cipher.go#L244).
+```
+if err := resp.Verify(req); err != nil {
+return err
+}
+```
 
 #### Process Handshake
 We proces the noise handshake message received from the response from remote visor with [ProcessHandshakeMessage](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/noise.go#L114).
@@ -458,4 +539,19 @@ The two `CipherStates` are finally generated where one is used for encryption of
 The `ciperStates` are generated with [s.ss.Split](https://github.com/skycoin/noise/blob/master/state.go#L146)
 ```
 cs1, cs2 := s.ss.Split()
+```
+
+# Encryption and Decryption
+
+In initiator and remote visor both the `CipherStates` generated are saved in [Noise](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/noise.go#L33) in `enc` and `dec`. They are used with the methods [EncryptUnsafe](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/noise.go#L145) and [DecryptUnsafe](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/noise.go#L154) whenever anything is written or read from the `dmsg.Stream` . It is used by [ReadWriter](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/read_writer.go#L50) from `Noise`.
+The [Read](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/read_writer.go#L73) method of the Noise `ReadWriter` uses the method `DecryptUnsafe` to read from the remote visor.
+```
+plaintext, err := rw.ns.DecryptUnsafe(ciphertext)
+if err != nil {
+	return 0, rw.processReadError(err)
+}
+```
+And The [Write](https://github.com/skycoin/dmsg/blob/develop/pkg/noise/read_writer.go#L124) method of the Noise `ReadWriter` uses the method `EncryptUnsafe` to write to the remote visor.
+```
+wb, err := WriteRawFrame(rw.origin, rw.ns.EncryptUnsafe(p[:wn]))
 ```
